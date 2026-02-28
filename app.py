@@ -24,7 +24,7 @@ CORS(app, supports_credentials=True)
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_FILE = os.path.join(BASE_DIR, 'config.json')
 BIN_DIR = os.path.join(BASE_DIR, 'bin')
-# 文件元数据存储（记录固定ID、文件名、用户、更新时间）
+# 文件元数据存储（记录固定ID、文件名、用户、更新时间、备注）
 METADATA_FILE = os.path.join(BASE_DIR, 'file_metadata.json')
 
 # 确保目录存在
@@ -32,9 +32,9 @@ for dir_path in [BIN_DIR, os.path.join(BIN_DIR, 'temp')]:
     if not os.path.exists(dir_path):
         os.makedirs(dir_path)
 
-# === 元数据管理（固定链接核心） ===
+# === 元数据管理（固定链接+备注核心） ===
 def load_metadata():
-    """加载文件元数据（固定ID映射）"""
+    """加载文件元数据（固定ID+备注映射）"""
     default_metadata = {}
     if os.path.exists(METADATA_FILE):
         try:
@@ -66,6 +66,7 @@ def get_file_fixed_id(username, filename):
             "fixed_id": fixed_id,
             "username": username,
             "filename": filename,
+            "note": "",  # 新增：备注字段，默认空
             "update_time": os.path.getmtime(get_safe_path(username, filename)) if os.path.exists(get_safe_path(username, filename)) else os.time()
         }
         save_metadata(metadata)
@@ -78,6 +79,22 @@ def get_filename_by_fixed_id(fixed_id):
         if info["fixed_id"] == fixed_id:
             return info["username"], info["filename"]
     return None, None
+
+def update_file_note(username, filename, new_note):
+    """更新文件备注"""
+    metadata = load_metadata()
+    user_file_key = f"{username}_{filename}"
+    if user_file_key in metadata:
+        metadata[user_file_key]["note"] = new_note.strip()
+        save_metadata(metadata)
+        return True
+    return False
+
+def get_file_note(username, filename):
+    """获取文件备注"""
+    metadata = load_metadata()
+    user_file_key = f"{username}_{filename}"
+    return metadata.get(user_file_key, {}).get("note", "")
 
 # === 配置管理 ===
 def load_config():
@@ -333,7 +350,22 @@ def change_password():
         return jsonify({"message": "密码修改成功"})
     return jsonify({"error": "用户不存在"}), 404
 
-# === 新增：固定链接访问Token文件 ===
+# === 新增：更新文件备注API ===
+@app.route('/api/update_note/<filename>', methods=['POST'])
+@login_required
+def update_note(filename):
+    """更新文件备注"""
+    username = session.get('username')
+    data = request.get_json()
+    new_note = data.get('note', '').strip()
+    
+    success = update_file_note(username, filename, new_note)
+    if success:
+        return jsonify({"message": "备注更新成功"})
+    else:
+        return jsonify({"error": "文件不存在或备注更新失败"}), 404
+
+# === 固定链接访问Token文件 ===
 @app.route('/token/<fixed_id>')
 def access_token_by_fixed_id(fixed_id):
     """通过固定ID访问Token文件（核心固定链接功能）"""
@@ -356,7 +388,7 @@ def access_token_by_fixed_id(fixed_id):
     except Exception as e:
         abort(500, f"读取文件失败: {str(e)}")
 
-# === 新增：更新Token文件内容/替换文件 ===
+# === 更新Token文件内容/替换文件 ===
 @app.route('/api/update_file/<filename>', methods=['POST'])
 @login_required
 def update_file(filename):
@@ -404,11 +436,11 @@ def update_file(filename):
     else:
         return jsonify({"error": "请提供文件或文本内容"}), 400
 
-# === API：文件管理 ===
+# === API：文件管理（包含备注） ===
 @app.route('/api/files')
 @login_required
 def list_files():
-    """列出用户所有文件（含固定链接）"""
+    """列出用户所有文件（含固定链接+备注）"""
     username = session.get('username')
     user_dir = get_user_bin_dir(username)
     files = []
@@ -419,13 +451,15 @@ def list_files():
                 # 获取固定ID和固定链接
                 fixed_id = get_file_fixed_id(username, filename)
                 fixed_url = f"{request.host_url}token/{fixed_id}"
-                # 获取文件大小和更新时间
+                # 获取文件大小、更新时间、备注
                 file_path = get_safe_path(username, filename)
                 file_size = os.path.getsize(file_path) / 1024  # KB
                 update_time = os.path.getmtime(file_path)
+                note = get_file_note(username, filename)
                 
                 files.append({
                     "filename": filename,
+                    "note": note,
                     "fixed_id": fixed_id,
                     "fixed_url": fixed_url,
                     "file_size": round(file_size, 2),
@@ -481,7 +515,7 @@ def delete_file(filename):
     except Exception as e:
         return jsonify({"error": f"删除失败: {str(e)}"}), 500
 
-# === 主页面（新增更新功能+固定链接展示） ===
+# === 主页面（新增备注功能） ===
 @app.route('/')
 @login_required
 def index():
@@ -503,6 +537,7 @@ def index():
         button { cursor: pointer; padding: 6px 12px; background-color: #007bff; color: white; border: none; border-radius: 3px; }
         button.delete { background-color: #dc3545; }
         button.update { background-color: #ffc107; color: black; }
+        button.save-note { background-color: #28a745; font-size: 0.8em; margin-left: 5px; }
         button.copy { background-color: #28a745; font-size: 0.8em; margin-left: 5px; }
         button.logout { background-color: #6c757d; }
         button.delete-account { background-color: #dc3545; margin-right: 10px; }
@@ -510,6 +545,7 @@ def index():
         button:hover { opacity: 0.8; }
         .url-cell { word-break: break-all; font-family: monospace; font-size: 0.9em; }
         .fixed-url { color: #28a745; font-weight: 600; }
+        .note-input { padding: 6px; width: 200px; border: 1px solid #ddd; border-radius: 3px; }
         
         /* Modal Styles */
         .modal { display: none; position: fixed; z-index: 1000; left: 0; top: 0; width: 100%; height: 100%; overflow: auto; background-color: rgba(0,0,0,0.4); }
@@ -542,13 +578,14 @@ def index():
         <h3>批量上传 bin 文件</h3>
         <input type="file" id="fileInput" accept=".bin" multiple>
         <button onclick="uploadFile()">上传</button>
-        <p style="margin-top: 10px; color: #666;">上传后的文件将生成<b>永久固定链接</b>，更新文件内容链接不变</p>
+        <p style="margin-top: 10px; color: #666;">上传后的文件将生成<b>永久固定链接</b>，更新文件内容/备注链接不变</p>
     </div>
 
     <table id="fileTable">
         <thead>
             <tr>
                 <th>文件名</th>
+                <th>备注名</th>
                 <th>文件大小(KB)</th>
                 <th>固定Token链接</th>
                 <th>操作</th>
@@ -673,6 +710,30 @@ def index():
             }
         }
 
+        // 保存文件备注
+        async function saveFileNote(filename) {
+            const noteInput = document.getElementById(`note-${filename}`);
+            const newNote = noteInput.value.trim();
+            
+            try {
+                const response = await fetch(`${API_BASE}/api/update_note/${filename}`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ note: newNote })
+                });
+                const result = await response.json();
+                if (response.ok) {
+                    alert(result.message);
+                    loadFiles(); // 刷新列表
+                } else {
+                    alert('备注保存失败: ' + (result.error || '未知错误'));
+                }
+            } catch (error) {
+                console.error('保存备注失败:', error);
+                alert('保存备注出错');
+            }
+        }
+
         // 加载文件列表
         async function loadFiles() {
             try {
@@ -689,6 +750,11 @@ def index():
                     const tr = document.createElement('tr');
                     tr.innerHTML = `
                         <td>${file.filename}</td>
+                        <td>
+                            <input type="text" id="note-${file.filename}" class="note-input" 
+                                   placeholder="输入备注名（选填）" value="${file.note || ''}">
+                            <button class="save-note" onclick="saveFileNote('${file.filename}')">保存</button>
+                        </td>
                         <td>${file.file_size} <span class="file-size">(更新于: ${new Date(file.update_time * 1000).toLocaleString()})</span></td>
                         <td class="url-cell">
                             <a href="${file.fixed_url}" target="_blank" class="fixed-url">${file.fixed_url}</a>
@@ -831,7 +897,7 @@ def index():
             const rows = document.querySelectorAll('#fileTable tbody tr');
             for (let row of rows) {
                 if (row.cells[0].textContent === filename) {
-                    const fixedUrl = row.cells[2].querySelector('a').href;
+                    const fixedUrl = row.cells[3].querySelector('a').href;
                     return fixedUrl.split('/').pop();
                 }
             }
