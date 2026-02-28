@@ -682,5 +682,20 @@ def home(token, bin_param, key):
     json_result1 = json.dumps(json_data1, indent=2)
     return json_result1
 
+# 1. 替换硬编码端口（适配平台的 PORT 环境变量）
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=5000)
+    port = int(os.environ.get('PORT', 5000))  # 读取平台端口变量
+    app.run(host='0.0.0.0', port=port, debug=False)  # 关闭debug（安全+平台要求）
+
+# 2. 会话存储适配（免费平台无本地存储，改用简单的文件/调整）
+# 原session依赖本地文件，免费平台多为临时文件系统，可替换为：
+# （可选）如果平台支持Redis（如Render有免费层），可改用Redis存储，否则保持默认（但会话可能不稳定）
+app.secret_key = os.environ.get('SECRET_KEY', os.urandom(24))  # 建议从环境变量配置密钥
+
+# 3. 配置文件路径调整（免费平台临时目录）
+BASE_DIR = os.environ.get('BASE_DIR', os.path.dirname(os.path.abspath(__file__)))
+CONFIG_FILE = os.path.join(BASE_DIR, 'config.json')
+BIN_DIR = os.path.join(BASE_DIR, 'bin')
+
+# 注：免费平台的本地文件系统是临时的！重启后文件会丢失！
+# 如果需要持久化bin文件/配置，需改用云存储（如S3/云开发存储），下文会提
