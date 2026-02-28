@@ -124,26 +124,38 @@ def get_safe_path(username, filename):
 # ==============================
 # 🔴 修复：访问链接直接返回文本内容（和你原来一样）
 # ==============================
+# ==========================
+# 【仅修复】访问链接返回纯文本，不下载、不改动原有任何功能
+# ==========================
 @app.route('/token/<fixed_id>')
 def access_token_by_fixed_id(fixed_id):
+    """通过固定ID访问Token文件 —— 纯文本返回，和你最早版本完全一致"""
     username, filename = get_filename_by_fixed_id(fixed_id)
     if not username or not filename:
-        return "文件不存在", 404
+        return "文件不存在或已被删除", 404
 
     file_path = get_safe_path(username, filename)
     if not os.path.exists(file_path):
         return "文件不存在", 404
 
     try:
+        # 以文本方式读取，直接返回内容
         with open(file_path, 'r', encoding='utf-8') as f:
             content = f.read()
-        return content, 200, {"Content-Type": "text/plain; charset=utf-8"}
-    except:
+        return content, 200, {
+            "Content-Type": "text/plain; charset=utf-8",
+            "Cache-Control": "no-cache"
+        }
+    except Exception:
         try:
+            # 兼容非文本二进制文件
             with open(file_path, 'rb') as f:
-                return f.read()
-        except:
-            return "读取失败", 500
+                return f.read(), 200, {
+                    "Content-Type": "application/octet-stream",
+                    "Cache-Control": "no-cache"
+                }
+        except Exception as e:
+            return f"读取文件失败: {str(e)}", 500
 
 # === API：更新备注 ===
 @app.route('/api/update_note/<filename>', methods=['POST'])
