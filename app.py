@@ -33,7 +33,7 @@ def load_config():
     }
     if os.path.exists(CONFIG_FILE):
         try:
-            with open(CONFIG_FILE, 'r') as f:
+            with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
                 data = json.load(f)
                 # 迁移旧配置格式
                 if "username" in data:
@@ -57,8 +57,8 @@ def load_config():
     return default_config
 
 def save_config(config_data):
-    with open(CONFIG_FILE, 'w') as f:
-        json.dump(config_data, f, indent=4)
+    with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
+        json.dump(config_data, f, indent=4, ensure_ascii=False)
 
 config = load_config()
 
@@ -131,13 +131,13 @@ def encode_to_base64(input_string):
 def decode_from_base64(encoded_string):
     encoded_bytes = encoded_string.encode('utf-8')
     decoded_bytes = base64.b64decode(encoded_bytes)
-    decoded_string = decoded_bytes.decode('utf-8')
+    decoded_string = decoded_bytes.decode('utf-8', errors='replace')
     return decoded_string
 
-# 新增：更新bin文件内容的函数
+# 新增：更新bin文件内容的函数（修复编码问题）
 def update_bin_file(username, filename, new_content):
     """
-    更新指定用户的bin文件内容
+    更新指定用户的bin文件内容（二进制写入，兼容所有编码）
     :param username: 用户名
     :param filename: 要更新的bin文件名（含.bin后缀）
     :param new_content: 新的token内容
@@ -146,9 +146,9 @@ def update_bin_file(username, filename, new_content):
     try:
         # 安全拼接用户目录+文件名
         file_path = safe_path_with_username(username, filename.replace('.bin', ''))
-        # 写入新内容（覆盖原有内容）
-        with open(file_path, 'w', encoding='utf-8') as f:
-            f.write(new_content)
+        # 二进制写入，避免编码错误
+        with open(file_path, 'wb') as f:
+            f.write(new_content.encode('utf-8'))
         return True
     except Exception as e:
         print(f"更新bin文件失败: {e}")
@@ -321,20 +321,49 @@ def change_password():
     
     return jsonify({"error": "用户不存在"}), 404
 
-# 新增：固定的token文件访问接口（URL固定为 /api/bin/文件名）
+# 核心：固定的token URL接口（返回指定格式 { "token": "base64编码内容" }）
 @app.route('/api/bin/<filename>')
 @login_required
 def serve_bin_file(filename):
-    """固定URL提供bin文件访问"""
+    """固定Token URL：返回 { "token": "base64编码内容" } 格式，兼容二进制文件"""
     username = session.get('username')
-    safe_file_path = safe_path_with_username(username, filename.replace('.bin', ''))
-    # 验证文件是否存在且属于当前用户
-    if not os.path.exists(safe_file_path) or not safe_file_path.startswith(get_user_bin_dir(username)):
+    # 1. 拼接安全文件路径
+    bin_param = filename.replace('.bin', '') if filename.endswith('.bin') else filename
+    safe_file_path = safe_path_with_username(username, bin_param)
+    
+    # 2. 验证文件是否存在
+    if not os.path.exists(safe_file_path):
         return jsonify({"error": "文件不存在"}), 404
-    # 返回文件内容
-    with open(safe_file_path, 'r', encoding='utf-8') as f:
-        content = f.read()
-    return jsonify({"filename": filename, "content": content, "url": f"/api/bin/{filename}"})
+    
+    # 3. 读取文件（二进制模式，避免编码错误）
+    try:
+        with open(safe_file_path, 'rb') as f:
+            file_content = f.read()  # 二进制读取，兼容所有文件类型
+    except Exception as e:
+        return jsonify({"error": f"读取文件失败: {str(e)}"}), 500
+    
+    # 4. 兼容多编码格式转换为字符串
+    try:
+        # 优先UTF-8，失败则用gbk/ISO-8859-1兜底
+        content_str = file_content.decode('utf-8', errors='replace')
+    except:
+        try:
+            content_str = file_content.decode('gbk', errors='replace')
+        except:
+            content_str = file_content.decode('ISO-8859-1', errors='replace')
+    
+    # 5. 提取Token内容（按原逻辑）
+    extracted_content = extract_token_content(content_str)
+    if "未找到" in extracted_content or "位置重叠" in extracted_content:
+        extracted_content = content_str  # 提取失败则用全部内容
+    
+    # 6. Base64编码（生成最终token）
+    encoded_token = encode_to_base64(extracted_content)
+    
+    # 7. 返回指定格式（仅token字段）
+    return jsonify({
+        "token": encoded_token
+    })
 
 # 新增：更新bin文件内容的接口
 @app.route('/api/files/<filename>/update', methods=['POST'])
@@ -366,11 +395,11 @@ def update_file(filename):
     else:
         return jsonify({"error": "文件更新失败"}), 500
 
-# 补充：原有文件管理接口（保持不变，仅补充完整）
+# 补充：文件上传接口
 @app.route('/api/upload', methods=['POST'])
 @login_required
 def upload_files():
-    """文件上传接口（原有逻辑补充完整）"""
+    """文件上传接口"""
     if 'files' not in request.files:
         return jsonify({"error": "未选择文件"}), 400
     
@@ -383,15 +412,17 @@ def upload_files():
         if file and file.filename.endswith('.bin'):
             safe_filename = werkzeug.utils.secure_filename(file.filename)
             file_path = os.path.join(user_bin_dir, safe_filename)
+            # 二进制保存上传文件，避免编码问题
             file.save(file_path)
             uploaded_count += 1
     
     return jsonify({"uploaded_count": uploaded_count}), 200
 
+# 补充：文件列表接口
 @app.route('/api/files', methods=['GET'])
 @login_required
 def list_files():
-    """列出当前用户的所有bin文件（原有逻辑补充完整）"""
+    """列出当前用户的所有bin文件"""
     username = session.get('username')
     user_bin_dir = get_user_bin_dir(username)
     files = []
@@ -409,10 +440,11 @@ def list_files():
     
     return jsonify(files)
 
+# 补充：文件删除接口
 @app.route('/api/files/<filename>', methods=['DELETE'])
 @login_required
 def delete_file(filename):
-    """删除指定bin文件（原有逻辑补充完整）"""
+    """删除指定bin文件"""
     username = session.get('username')
     safe_filename = werkzeug.utils.secure_filename(filename)
     file_path = os.path.join(get_user_bin_dir(username), safe_filename)
@@ -531,14 +563,14 @@ def index():
             document.getElementById('newPassword').value = "";
         }
 
-        // 新增：打开更新Token的弹窗
+        // 打开更新Token的弹窗
         function openUpdateTokenModal(filename) {
             currentUpdateFilename = filename;
             document.getElementById('newTokenContent').value = "";
             document.getElementById('updateTokenModal').style.display = "block";
         }
 
-        // 新增：关闭更新Token的弹窗
+        // 关闭更新Token的弹窗
         function closeUpdateTokenModal() {
             document.getElementById('updateTokenModal').style.display = "none";
             currentUpdateFilename = '';
@@ -583,7 +615,7 @@ def index():
             }
         }
 
-        // 新增：确认更新Token内容
+        // 确认更新Token内容
         async function confirmUpdateToken() {
             const newContent = document.getElementById('newTokenContent').value;
             if (!newContent) {
@@ -671,11 +703,10 @@ def index():
                 });
             } catch (error) {
                 console.error('加载文件失败:', error);
-                // alert('加载文件列表失败');
             }
         }
 
-        // 补充：复制到剪贴板函数
+        // 复制到剪贴板函数
         function copyToClipboard(text) {
             navigator.clipboard.writeText(text).then(() => {
                 alert('复制成功！');
