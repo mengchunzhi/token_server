@@ -5,37 +5,94 @@ import os
 import json
 import base64
 import secrets
+import uuid
 from functools import wraps
-from flask import Flask, jsonify, request, send_from_directory, render_template_string, session, redirect, url_for
+from flask import Flask, jsonify, request, send_from_directory, render_template_string, session, redirect, url_for, abort
 from flask_cors import CORS
 import werkzeug.utils
+from werkzeug.exceptions import HTTPException
 
+# === 适配Render部署的基础配置 ===
 app = Flask(__name__)
-app.secret_key = os.urandom(24)
-CORS(app)
-
-# 加载配置文件
+# 从环境变量获取secret_key，适配Render部署
+app.secret_key = os.environ.get('FLASK_SECRET_KEY', os.urandom(24))
+# Render的端口通过环境变量PORT获取
+PORT = int(os.environ.get('PORT', 5000))
+# 配置CORS，适配Render的跨域
+CORS(app, supports_credentials=True)
+# 基础路径配置
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_FILE = os.path.join(BASE_DIR, 'config.json')
 BIN_DIR = os.path.join(BASE_DIR, 'bin')
+# 文件元数据存储（记录固定ID、文件名、用户、更新时间）
+METADATA_FILE = os.path.join(BASE_DIR, 'file_metadata.json')
 
-if not os.path.exists(BIN_DIR):
-    os.makedirs(BIN_DIR)
+# 确保目录存在
+for dir_path in [BIN_DIR, os.path.join(BIN_DIR, 'temp')]:
+    if not os.path.exists(dir_path):
+        os.makedirs(dir_path)
 
+# === 元数据管理（固定链接核心） ===
+def load_metadata():
+    """加载文件元数据（固定ID映射）"""
+    default_metadata = {}
+    if os.path.exists(METADATA_FILE):
+        try:
+            with open(METADATA_FILE, 'r', encoding='utf-8') as f:
+                return json.load(f)
+        except Exception as e:
+            print(f"加载元数据失败: {e}")
+            return default_metadata
+    return default_metadata
+
+def save_metadata(metadata):
+    """保存文件元数据"""
+    try:
+        with open(METADATA_FILE, 'w', encoding='utf-8') as f:
+            json.dump(metadata, f, indent=4, ensure_ascii=False)
+    except Exception as e:
+        print(f"保存元数据失败: {e}")
+        raise
+
+def get_file_fixed_id(username, filename):
+    """获取文件的固定ID（不存在则创建）"""
+    metadata = load_metadata()
+    # 构建用户-文件唯一键
+    user_file_key = f"{username}_{filename}"
+    if user_file_key not in metadata:
+        # 生成永久固定ID（UUID4）
+        fixed_id = str(uuid.uuid4())
+        metadata[user_file_key] = {
+            "fixed_id": fixed_id,
+            "username": username,
+            "filename": filename,
+            "update_time": os.path.getmtime(get_safe_path(username, filename)) if os.path.exists(get_safe_path(username, filename)) else os.time()
+        }
+        save_metadata(metadata)
+    return metadata[user_file_key]["fixed_id"]
+
+def get_filename_by_fixed_id(fixed_id):
+    """通过固定ID反向查找文件名和用户"""
+    metadata = load_metadata()
+    for key, info in metadata.items():
+        if info["fixed_id"] == fixed_id:
+            return info["username"], info["filename"]
+    return None, None
+
+# === 配置管理 ===
 def load_config():
     default_config = {
         "users": {
             "admin": {
-                "password": "admin123",
+                "password": os.environ.get('ADMIN_PASSWORD', 'admin123'),  # 优先环境变量
                 "token": secrets.token_hex(16)
             }
         }
     }
     if os.path.exists(CONFIG_FILE):
         try:
-            with open(CONFIG_FILE, 'r') as f:
+            with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
                 data = json.load(f)
-                # 迁移旧配置格式
                 if "username" in data:
                     token = secrets.token_hex(16)
                     new_config = {
@@ -49,19 +106,24 @@ def load_config():
                     save_config(new_config)
                     return new_config
                 return data
-        except Exception:
+        except Exception as e:
+            print(f"加载配置失败: {e}")
             return default_config
     else:
-        # 如果文件不存在，保存默认配置
         save_config(default_config)
     return default_config
 
 def save_config(config_data):
-    with open(CONFIG_FILE, 'w') as f:
-        json.dump(config_data, f, indent=4)
+    try:
+        with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
+            json.dump(config_data, f, indent=4, ensure_ascii=False)
+    except Exception as e:
+        print(f"保存配置失败: {e}")
+        raise
 
 config = load_config()
 
+# === 装饰器 & 工具函数 ===
 def login_required(f):
     @wraps(f)
     def decorated_function(*args, **kwargs):
@@ -71,78 +133,54 @@ def login_required(f):
     return decorated_function
 
 def get_user_bin_dir(username):
+    """获取用户专属bin目录"""
     user_dir = os.path.join(BIN_DIR, username)
     if not os.path.exists(user_dir):
         os.makedirs(user_dir)
     return user_dir
 
-def safe_path_with_username(username, bin_param):
-    # 过滤危险字符，拼接安全路径
-    filename = f"{bin_param}.bin"
+def get_safe_path(username, filename):
+    """生成安全的用户文件路径"""
     safe_filename = werkzeug.utils.secure_filename(filename)
     return os.path.join(get_user_bin_dir(username), safe_filename)
 
 def extract_target_chars(text):
-    # 保留字母(a-zA-Z)、数字(0-9)及特定符号(+=?/)
     pattern = r'[^a-zA-Z0-9+=?/]'
     return re.sub(pattern, '', text)
 
-ALLOWED_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'bin')  # 限制文件读取目录
-if not os.path.exists(ALLOWED_DIR):
-    os.makedirs(ALLOWED_DIR)
-
-def safe_path(bin_param):
-    # 过滤危险字符，拼接安全路径
-    filename = f"{bin_param}.bin"
-    safe_filename = os.path.basename(filename)  # 防止路径遍历
-    return os.path.join(ALLOWED_DIR, safe_filename)
-    
 def extract_token_content(result_str):
-    # 查找'token'的位置（注意大小写）
     token_start = result_str.find('Token')
     if token_start == -1:
         return "未找到'Token'关键词"
-   
-    # 查找'roleId'的位置（注意大小写）
     roleid_start = result_str.find('roleId')
     if roleid_start == -1:
         return "未找到'roleId'关键词"
-   
-    # 计算token结束位置（跳过'token'本身）
     token_end = token_start + len('Token')
-   
-    # 提取token到roleId之间的内容
     if token_end >= roleid_start:
         return "token和roleId位置重叠或顺序不正确"
-    extracted_content = result_str[token_end:roleid_start]
-    return extracted_content
+    return result_str[token_end:roleid_start]
 
 def encode_to_base64(input_string):
-    # 将字符串转换为bytes
     input_bytes = input_string.encode('utf-8')
-    
-    # 进行Base64编码
     encoded_bytes = base64.b64encode(input_bytes)
-    
-    # 将编码后的bytes转换回字符串
-    encoded_string = encoded_bytes.decode('utf-8')
-    return encoded_string
+    return encoded_bytes.decode('utf-8')
 
 def decode_from_base64(encoded_string):
-    encoded_bytes = encoded_string.encode('utf-8')
-    decoded_bytes = base64.b64decode(encoded_bytes)
-    decoded_string = decoded_bytes.decode('utf-8')
-    return decoded_string
+    try:
+        encoded_bytes = encoded_string.encode('utf-8')
+        decoded_bytes = base64.b64decode(encoded_bytes)
+        return decoded_bytes.decode('utf-8')
+    except Exception:
+        return "Base64解码失败"
 
-
+# === 核心路由 ===
 @app.route('/login', methods=['GET', 'POST'])
 def login():
     error = None
     if request.method == 'POST':
-        username = request.form['username']
-        password = request.form['password']
+        username = request.form.get('username', '').strip()
+        password = request.form.get('password', '').strip()
         
-        # 重新加载配置
         current_config = load_config()
         users = current_config.get('users', {})
         
@@ -190,8 +228,8 @@ def login():
 def register():
     error = None
     if request.method == 'POST':
-        username = request.form['username']
-        password = request.form['password']
+        username = request.form.get('username', '').strip()
+        password = request.form.get('password', '').strip()
         
         if not username or not password:
             error = '用户名和密码不能为空'
@@ -202,17 +240,13 @@ def register():
             if username in users:
                 error = '用户名已存在'
             else:
-                # 创建新用户
                 users[username] = {
                     "password": password,
                     "token": secrets.token_hex(16)
                 }
                 current_config['users'] = users
                 save_config(current_config)
-                
-                # 创建用户目录
                 get_user_bin_dir(username)
-                
                 return redirect(url_for('login'))
     
     return render_template_string('''
@@ -258,29 +292,28 @@ def logout():
 @login_required
 def delete_account():
     username = session.get('username')
-    
-    # 防止删除管理员账号
     if username == 'admin':
         return jsonify({"error": "无法删除管理员账号"}), 403
     
-    # 删除用户数据
+    # 删除用户配置
     current_config = load_config()
     if username in current_config['users']:
         del current_config['users'][username]
         save_config(current_config)
     
-    # 删除用户目录
+    # 删除用户文件和元数据
     user_dir = get_user_bin_dir(username)
     if os.path.exists(user_dir):
-        try:
-            shutil.rmtree(user_dir)
-        except Exception as e:
-            return jsonify({"error": f"删除文件失败: {str(e)}"}), 500
-            
+        shutil.rmtree(user_dir)
+    metadata = load_metadata()
+    to_delete = [k for k in metadata if metadata[k]['username'] == username]
+    for k in to_delete:
+        del metadata[k]
+    save_metadata(metadata)
+    
     # 登出
     session.pop('logged_in', None)
     session.pop('username', None)
-    
     return jsonify({"message": "账号已删除"})
 
 @app.route('/change_password', methods=['POST'])
@@ -288,20 +321,167 @@ def delete_account():
 def change_password():
     username = session.get('username')
     data = request.get_json()
+    new_password = data.get('new_password', '').strip()
     
-    if not data or 'new_password' not in data:
+    if not new_password:
         return jsonify({"error": "新密码不能为空"}), 400
         
-    new_password = data['new_password']
-    
     current_config = load_config()
     if username in current_config['users']:
         current_config['users'][username]['password'] = new_password
         save_config(current_config)
         return jsonify({"message": "密码修改成功"})
-    
     return jsonify({"error": "用户不存在"}), 404
 
+# === 新增：固定链接访问Token文件 ===
+@app.route('/token/<fixed_id>')
+def access_token_by_fixed_id(fixed_id):
+    """通过固定ID访问Token文件（核心固定链接功能）"""
+    username, filename = get_filename_by_fixed_id(fixed_id)
+    if not username or not filename:
+        abort(404, "文件不存在或已被删除")
+    
+    file_path = get_safe_path(username, filename)
+    if not os.path.exists(file_path):
+        abort(404, "文件不存在")
+    
+    # 返回文件内容（适配二进制/文本）
+    try:
+        with open(file_path, 'rb') as f:
+            content = f.read()
+        return content, 200, {
+            'Content-Type': 'application/octet-stream',
+            'Cache-Control': 'no-cache'  # 禁用缓存，确保获取最新内容
+        }
+    except Exception as e:
+        abort(500, f"读取文件失败: {str(e)}")
+
+# === 新增：更新Token文件内容/替换文件 ===
+@app.route('/api/update_file/<filename>', methods=['POST'])
+@login_required
+def update_file(filename):
+    """更新Token文件（支持内容替换/文件替换）"""
+    username = session.get('username')
+    file_path = get_safe_path(username, filename)
+    
+    if not os.path.exists(file_path):
+        return jsonify({"error": "文件不存在"}), 404
+    
+    # 两种更新方式：1. 上传新文件 2. 直接编辑文本内容
+    if 'file' in request.files:
+        # 文件替换
+        new_file = request.files['file']
+        if not new_file.filename.endswith('.bin'):
+            return jsonify({"error": "仅支持.bin文件"}), 400
+        
+        # 覆盖原文件
+        new_file.save(file_path)
+        # 更新元数据时间
+        metadata = load_metadata()
+        user_file_key = f"{username}_{filename}"
+        if user_file_key in metadata:
+            metadata[user_file_key]['update_time'] = os.time()
+            save_metadata(metadata)
+        
+        return jsonify({"message": "文件更新成功"})
+    
+    elif 'content' in request.json:
+        # 文本内容更新（适用于文本型bin文件）
+        content = request.json['content']
+        try:
+            with open(file_path, 'w', encoding='utf-8') as f:
+                f.write(content)
+            # 更新元数据时间
+            metadata = load_metadata()
+            user_file_key = f"{username}_{filename}"
+            if user_file_key in metadata:
+                metadata[user_file_key]['update_time'] = os.time()
+                save_metadata(metadata)
+            return jsonify({"message": "文件内容更新成功"})
+        except Exception as e:
+            return jsonify({"error": f"写入内容失败: {str(e)}"}), 500
+    
+    else:
+        return jsonify({"error": "请提供文件或文本内容"}), 400
+
+# === API：文件管理 ===
+@app.route('/api/files')
+@login_required
+def list_files():
+    """列出用户所有文件（含固定链接）"""
+    username = session.get('username')
+    user_dir = get_user_bin_dir(username)
+    files = []
+    
+    if os.path.exists(user_dir):
+        for filename in os.listdir(user_dir):
+            if filename.endswith('.bin'):
+                # 获取固定ID和固定链接
+                fixed_id = get_file_fixed_id(username, filename)
+                fixed_url = f"{request.host_url}token/{fixed_id}"
+                # 获取文件大小和更新时间
+                file_path = get_safe_path(username, filename)
+                file_size = os.path.getsize(file_path) / 1024  # KB
+                update_time = os.path.getmtime(file_path)
+                
+                files.append({
+                    "filename": filename,
+                    "fixed_id": fixed_id,
+                    "fixed_url": fixed_url,
+                    "file_size": round(file_size, 2),
+                    "update_time": update_time,
+                    "url": f"/token/{fixed_id}"
+                })
+    
+    return jsonify(files)
+
+@app.route('/api/upload', methods=['POST'])
+@login_required
+def upload_files():
+    """批量上传bin文件"""
+    username = session.get('username')
+    if 'files' not in request.files:
+        return jsonify({"error": "未选择文件"}), 400
+    
+    files = request.files.getlist('files')
+    uploaded_count = 0
+    
+    for file in files:
+        if file.filename == '':
+            continue
+        if file.filename.endswith('.bin'):
+            filename = werkzeug.utils.secure_filename(file.filename)
+            file_path = get_safe_path(username, filename)
+            file.save(file_path)
+            # 生成固定ID（自动写入元数据）
+            get_file_fixed_id(username, filename)
+            uploaded_count += 1
+    
+    return jsonify({"uploaded_count": uploaded_count, "message": "上传完成"})
+
+@app.route('/api/files/<filename>', methods=['DELETE'])
+@login_required
+def delete_file(filename):
+    """删除文件（含元数据）"""
+    username = session.get('username')
+    file_path = get_safe_path(username, filename)
+    
+    if not os.path.exists(file_path):
+        return jsonify({"error": "文件不存在"}), 404
+    
+    try:
+        os.remove(file_path)
+        # 删除元数据
+        metadata = load_metadata()
+        user_file_key = f"{username}_{filename}"
+        if user_file_key in metadata:
+            del metadata[user_file_key]
+            save_metadata(metadata)
+        return jsonify({"message": "文件已删除"})
+    except Exception as e:
+        return jsonify({"error": f"删除失败: {str(e)}"}), 500
+
+# === 主页面（新增更新功能+固定链接展示） ===
 @app.route('/')
 @login_required
 def index():
@@ -313,30 +493,34 @@ def index():
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Token URL & Bin 文件管理</title>
     <style>
-        body { font-family: Arial, sans-serif; max-width: 800px; margin: 0 auto; padding: 20px; }
+        body { font-family: Arial, sans-serif; max-width: 1000px; margin: 0 auto; padding: 20px; }
         h1 { text-align: center; }
-        .header-controls { display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px; }
+        .header-controls { display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px; flex-wrap: wrap; gap: 10px; }
         .upload-section { margin-bottom: 20px; padding: 15px; border: 1px solid #ddd; border-radius: 5px; }
         table { width: 100%; border-collapse: collapse; margin-top: 20px; }
-        th, td { border: 1px solid #ddd; padding: 10px; text-align: left; }
+        th, td { border: 1px solid #ddd; padding: 12px; text-align: left; }
         th { background-color: #f2f2f2; }
-        button { cursor: pointer; padding: 5px 10px; background-color: #007bff; color: white; border: none; border-radius: 3px; }
+        button { cursor: pointer; padding: 6px 12px; background-color: #007bff; color: white; border: none; border-radius: 3px; }
         button.delete { background-color: #dc3545; }
+        button.update { background-color: #ffc107; color: black; }
+        button.copy { background-color: #28a745; font-size: 0.8em; margin-left: 5px; }
+        button.logout { background-color: #6c757d; }
+        button.delete-account { background-color: #dc3545; margin-right: 10px; }
+        button.change-password { background-color: #ffc107; color: black; margin-right: 10px; }
         button:hover { opacity: 0.8; }
         .url-cell { word-break: break-all; font-family: monospace; font-size: 0.9em; }
-        .copy-btn { margin-left: 5px; background-color: #28a745; font-size: 0.8em; }
-        .logout-btn { background-color: #6c757d; }
-        .delete-account-btn { background-color: #dc3545; margin-right: 10px; }
-        .change-password-btn { background-color: #ffc107; color: black; margin-right: 10px; }
+        .fixed-url { color: #28a745; font-weight: 600; }
         
         /* Modal Styles */
-        .modal { display: none; position: fixed; z-index: 1; left: 0; top: 0; width: 100%; height: 100%; overflow: auto; background-color: rgba(0,0,0,0.4); }
-        .modal-content { background-color: #fefefe; margin: 15% auto; padding: 20px; border: 1px solid #888; width: 300px; border-radius: 5px; }
+        .modal { display: none; position: fixed; z-index: 1000; left: 0; top: 0; width: 100%; height: 100%; overflow: auto; background-color: rgba(0,0,0,0.4); }
+        .modal-content { background-color: #fefefe; margin: 8% auto; padding: 20px; border: 1px solid #888; width: 90%; max-width: 500px; border-radius: 5px; }
         .close { color: #aaa; float: right; font-size: 28px; font-weight: bold; cursor: pointer; }
-        .close:hover, .close:focus { color: black; text-decoration: none; cursor: pointer; }
-        .modal input { width: 100%; padding: 10px; margin: 10px 0; display: inline-block; border: 1px solid #ccc; border-radius: 4px; box-sizing: border-box; }
-        .modal button { width: 100%; background-color: #4CAF50; color: white; padding: 14px 20px; margin: 8px 0; border: none; border-radius: 4px; cursor: pointer; }
-        .modal button:hover { background-color: #45a049; }
+        .close:hover { color: black; }
+        .modal input, .modal textarea { width: 100%; padding: 10px; margin: 10px 0; display: inline-block; border: 1px solid #ccc; border-radius: 4px; box-sizing: border-box; }
+        .modal textarea { min-height: 200px; resize: vertical; }
+        .modal-buttons { display: flex; gap: 10px; margin-top: 15px; }
+        .modal-buttons button { flex: 1; }
+        .file-size { font-size: 0.85em; color: #666; }
     </style>
 </head>
 <body>
@@ -345,11 +529,11 @@ def index():
             <span>欢迎, {{ session['username'] }}</span>
         </div>
         <div>
-            <button class="change-password-btn" onclick="openPasswordModal()">修改密码</button>
+            <button class="change-password" onclick="openPasswordModal()">修改密码</button>
             {% if session['username'] != 'admin' %}
-            <button class="delete-account-btn" onclick="deleteAccount()">注销账号</button>
+            <button class="delete-account" onclick="deleteAccount()">注销账号</button>
             {% endif %}
-            <button class="logout-btn" onclick="window.location.href='/logout'">退出登录</button>
+            <button class="logout" onclick="window.location.href='/logout'">退出登录</button>
         </div>
     </div>
     <h1>Token URL & Bin 文件管理</h1>
@@ -358,13 +542,15 @@ def index():
         <h3>批量上传 bin 文件</h3>
         <input type="file" id="fileInput" accept=".bin" multiple>
         <button onclick="uploadFile()">上传</button>
+        <p style="margin-top: 10px; color: #666;">上传后的文件将生成<b>永久固定链接</b>，更新文件内容链接不变</p>
     </div>
 
     <table id="fileTable">
         <thead>
             <tr>
                 <th>文件名</th>
-                <th>Token URL</th>
+                <th>文件大小(KB)</th>
+                <th>固定Token链接</th>
                 <th>操作</th>
             </tr>
         </thead>
@@ -373,7 +559,7 @@ def index():
         </tbody>
     </table>
 
-    <!-- Password Change Modal -->
+    <!-- 密码修改弹窗 -->
     <div id="passwordModal" class="modal">
         <div class="modal-content">
             <span class="close" onclick="closePasswordModal()">&times;</span>
@@ -383,42 +569,80 @@ def index():
         </div>
     </div>
 
+    <!-- 文件更新弹窗 -->
+    <div id="updateFileModal" class="modal">
+        <div class="modal-content">
+            <span class="close" onclick="closeUpdateFileModal()">&times;</span>
+            <h3>更新文件：<span id="updateFilename"></span></h3>
+            <div style="margin: 15px 0;">
+                <p>方式1：上传新的.bin文件覆盖（推荐）</p>
+                <input type="file" id="updateFileInput" accept=".bin">
+            </div>
+            <div style="margin: 15px 0;">
+                <p>方式2：直接编辑文件内容（文本格式）</p>
+                <textarea id="updateFileContent" placeholder="输入文件内容..."></textarea>
+            </div>
+            <div class="modal-buttons">
+                <button onclick="submitFileUpdate()">确认更新</button>
+                <button onclick="closeUpdateFileModal()" style="background-color: #6c757d;">取消</button>
+            </div>
+        </div>
+    </div>
+
     <script>
         const API_BASE = '';
+        let currentUpdateFilename = '';
 
+        // 密码弹窗控制
         function openPasswordModal() {
             document.getElementById('passwordModal').style.display = "block";
         }
-
         function closePasswordModal() {
             document.getElementById('passwordModal').style.display = "none";
             document.getElementById('newPassword').value = "";
         }
 
+        // 文件更新弹窗控制
+        function openUpdateFileModal(filename) {
+            currentUpdateFilename = filename;
+            document.getElementById('updateFilename').textContent = filename;
+            document.getElementById('updateFileInput').value = "";
+            document.getElementById('updateFileContent').value = "";
+            // 预加载文件内容（可选）
+            fetch(`/token/${getFixedIdByFilename(filename)}`)
+                .then(res => res.text())
+                .then(content => {
+                    document.getElementById('updateFileContent').value = content;
+                })
+                .catch(err => console.log('预加载内容失败:', err));
+            document.getElementById('updateFileModal').style.display = "block";
+        }
+        function closeUpdateFileModal() {
+            document.getElementById('updateFileModal').style.display = "none";
+            currentUpdateFilename = '';
+        }
+
+        // 点击空白处关闭弹窗
         window.onclick = function(event) {
-            if (event.target == document.getElementById('passwordModal')) {
-                closePasswordModal();
+            if (event.target.classList.contains('modal')) {
+                event.target.style.display = "none";
             }
         }
 
+        // 修改密码
         async function changePassword() {
-            const newPassword = document.getElementById('newPassword').value;
+            const newPassword = document.getElementById('newPassword').value.trim();
             if (!newPassword) {
                 alert("请输入新密码");
                 return;
             }
-
             try {
                 const response = await fetch(`${API_BASE}/change_password`, {
                     method: 'POST',
-                    headers: {
-                        'Content-Type': 'application/json'
-                    },
+                    headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ new_password: newPassword })
                 });
-                
                 const result = await response.json();
-                
                 if (response.ok) {
                     alert(result.message);
                     closePasswordModal();
@@ -431,14 +655,11 @@ def index():
             }
         }
 
+        // 注销账号
         async function deleteAccount() {
             if (!confirm('确定要注销账号吗？此操作将永久删除您的账号及所有上传的文件，且不可恢复！')) return;
-            
             try {
-                const response = await fetch(`${API_BASE}/delete_account`, {
-                    method: 'POST'
-                });
-                
+                const response = await fetch(`${API_BASE}/delete_account`, { method: 'POST' });
                 if (response.ok) {
                     alert('账号已注销');
                     window.location.href = '/login';
@@ -452,6 +673,7 @@ def index():
             }
         }
 
+        // 加载文件列表
         async function loadFiles() {
             try {
                 const response = await fetch(`${API_BASE}/api/files`);
@@ -465,16 +687,15 @@ def index():
                 
                 files.forEach(file => {
                     const tr = document.createElement('tr');
-                    
-                    const fullUrl = `${window.location.origin}${file.url}`;
-                    
                     tr.innerHTML = `
                         <td>${file.filename}</td>
+                        <td>${file.file_size} <span class="file-size">(更新于: ${new Date(file.update_time * 1000).toLocaleString()})</span></td>
                         <td class="url-cell">
-                            <a href="${file.url}" target="_blank">${file.url}</a>
-                            <button class="copy-btn" onclick="copyToClipboard('${fullUrl}')">复制完整链接</button>
+                            <a href="${file.fixed_url}" target="_blank" class="fixed-url">${file.fixed_url}</a>
+                            <button class="copy" onclick="copyToClipboard('${file.fixed_url}')">复制</button>
                         </td>
                         <td>
+                            <button class="update" onclick="openUpdateFileModal('${file.filename}')">更新</button>
                             <button class="delete" onclick="deleteFile('${file.filename}')">删除</button>
                         </td>
                     `;
@@ -482,10 +703,10 @@ def index():
                 });
             } catch (error) {
                 console.error('加载文件失败:', error);
-                // alert('加载文件列表失败');
             }
         }
 
+        // 上传文件
         async function uploadFile() {
             const fileInput = document.getElementById('fileInput');
             const files = fileInput.files;
@@ -493,7 +714,6 @@ def index():
                 alert('请选择至少一个文件');
                 return;
             }
-            
             const formData = new FormData();
             let validCount = 0;
             for (let i = 0; i < files.length; i++) {
@@ -502,19 +722,16 @@ def index():
                     validCount++;
                 }
             }
-            
             if (validCount === 0) {
                 alert('只能上传 .bin 文件');
                 return;
             }
-
             try {
                 const response = await fetch(`${API_BASE}/api/upload`, {
                     method: 'POST',
                     body: formData
                 });
                 const result = await response.json();
-                
                 if (response.ok) {
                     alert(`成功上传 ${result.uploaded_count} 个文件`);
                     fileInput.value = '';
@@ -529,22 +746,17 @@ def index():
             }
         }
 
+        // 删除文件
         async function deleteFile(filename) {
             if (!confirm(`确定要删除 ${filename} 吗？`)) return;
-
             try {
-                const response = await fetch(`${API_BASE}/api/files/${filename}`, {
-                    method: 'DELETE'
-                });
-                
+                const response = await fetch(`${API_BASE}/api/files/${filename}`, { method: 'DELETE' });
                 if (response.ok) {
+                    alert('文件已删除');
                     loadFiles();
                 } else {
-                    if (response.status === 401) window.location.href = '/login';
-                    else {
-                        const result = await response.json();
-                        alert('删除失败: ' + (result.error || '未知错误'));
-                    }
+                    const result = await response.json();
+                    alert('删除失败: ' + (result.error || '未知错误'));
                 }
             } catch (error) {
                 console.error('删除失败:', error);
@@ -552,150 +764,105 @@ def index():
             }
         }
 
-        function copyToClipboard(text) {
-            navigator.clipboard.writeText(text).then(() => {
-                alert('链接已复制到剪贴板');
-            }).catch(err => {
-                console.error('复制失败:', err);
-                alert('复制失败，请手动复制');
-            });
+        // 更新文件
+        async function submitFileUpdate() {
+            if (!currentUpdateFilename) return;
+            const fileInput = document.getElementById('updateFileInput');
+            const fileContent = document.getElementById('updateFileContent').value.trim();
+            
+            // 验证：必须选文件或填内容
+            if (!fileInput.files.length && !fileContent) {
+                alert('请上传新文件或输入文件内容');
+                return;
+            }
+
+            try {
+                let response;
+                // 方式1：文件上传
+                if (fileInput.files.length) {
+                    const formData = new FormData();
+                    formData.append('file', fileInput.files[0]);
+                    response = await fetch(`${API_BASE}/api/update_file/${currentUpdateFilename}`, {
+                        method: 'POST',
+                        body: formData
+                    });
+                } 
+                // 方式2：内容更新
+                else {
+                    response = await fetch(`${API_BASE}/api/update_file/${currentUpdateFilename}`, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ content: fileContent })
+                    });
+                }
+
+                const result = await response.json();
+                if (response.ok) {
+                    alert(result.message);
+                    closeUpdateFileModal();
+                    loadFiles();
+                } else {
+                    alert('更新失败: ' + (result.error || '未知错误'));
+                }
+            } catch (error) {
+                console.error('更新失败:', error);
+                alert('更新出错');
+            }
         }
 
-        // 页面加载时获取文件列表
-        loadFiles();
+        // 复制到剪贴板
+        function copyToClipboard(text) {
+            navigator.clipboard.writeText(text)
+                .then(() => alert('链接已复制到剪贴板'))
+                .catch(() => {
+                    // 降级方案
+                    const textArea = document.createElement('textarea');
+                    textArea.value = text;
+                    document.body.appendChild(textArea);
+                    textArea.select();
+                    document.execCommand('copy');
+                    document.body.removeChild(textArea);
+                    alert('链接已复制到剪贴板');
+                });
+        }
+
+        // 辅助：通过文件名找固定ID（用于预加载内容）
+        function getFixedIdByFilename(filename) {
+            const rows = document.querySelectorAll('#fileTable tbody tr');
+            for (let row of rows) {
+                if (row.cells[0].textContent === filename) {
+                    const fixedUrl = row.cells[2].querySelector('a').href;
+                    return fixedUrl.split('/').pop();
+                }
+            }
+            return '';
+        }
+
+        // 页面加载时加载文件列表
+        window.onload = loadFiles;
     </script>
 </body>
 </html>
-    ''')
+    ''', session=session)
 
-@app.route('/api/files', methods=['GET'])
-@login_required
-def list_files():
-    files = []
-    username = session.get('username')
-    user_dir = get_user_bin_dir(username)
-    current_config = load_config()
-    user_token = current_config['users'][username]['token']
-    
-    try:
-        for filename in os.listdir(user_dir):
-            if filename.endswith('.bin'):
-                name_no_ext = os.path.splitext(filename)[0]
-                encoded_key = encode_to_base64(name_no_ext)
-                files.append({
-                    "filename": filename,
-                    "name": name_no_ext,
-                    "url": f"/{user_token}/{name_no_ext}/{encoded_key}"
-                })
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-    return jsonify(files)
+# === 错误处理 & 启动配置 ===
+@app.errorhandler(HTTPException)
+def handle_http_exception(e):
+    """统一HTTP错误处理"""
+    response = jsonify({"error": e.description})
+    response.status_code = e.code
+    return response
 
-@app.route('/api/upload', methods=['POST'])
-@login_required
-def upload_file():
-    if 'files' not in request.files:
-        return jsonify({"error": "未找到文件部分"}), 400
-    
-    files = request.files.getlist('files')
-    if not files or files[0].filename == '':
-        return jsonify({"error": "未选择文件"}), 400
-        
-    username = session.get('username')
-    user_dir = get_user_bin_dir(username)
-    uploaded_count = 0
-    
-    for file in files:
-        if file and file.filename.endswith('.bin'):
-            filename = werkzeug.utils.secure_filename(file.filename)
-            file.save(os.path.join(user_dir, filename))
-            uploaded_count += 1
-            
-    if uploaded_count > 0:
-        return jsonify({"message": "文件上传成功", "uploaded_count": uploaded_count})
-    
-    return jsonify({"error": "没有有效的 bin 文件上传"}), 400
+@app.errorhandler(Exception)
+def handle_generic_exception(e):
+    """统一异常处理（适配Render日志）"""
+    print(f"服务器错误: {str(e)}")  # Render日志会捕获print输出
+    return jsonify({"error": "服务器内部错误"}), 500
 
-@app.route('/api/files/<filename>', methods=['DELETE'])
-@login_required
-def delete_file(filename):
-    if not filename.endswith('.bin'):
-        return jsonify({"error": "无效的文件名"}), 400
-    
-    username = session.get('username')
-    user_dir = get_user_bin_dir(username)
-    safe_filename = werkzeug.utils.secure_filename(filename)
-    file_path = os.path.join(user_dir, safe_filename)
-    
-    if os.path.exists(file_path):
-        try:
-            os.remove(file_path)
-            return jsonify({"message": "文件删除成功"})
-        except Exception as e:
-            return jsonify({"error": str(e)}), 500
-    else:
-        return jsonify({"error": "文件未找到"}), 404
-
-@app.route('/<string:token>/<string:bin_param>/<string:key>')
-def home(token, bin_param, key):
-    # 验证 token
-    current_config = load_config()
-    users = current_config.get('users', {})
-    
-    # 查找 token 对应的用户
-    valid_user = None
-    for username, user_data in users.items():
-        if user_data.get('token') == token:
-            valid_user = username
-            break
-    
-    if not valid_user:
-        return jsonify({"error": "无效的 Token"}), 403
-
-    if key != encode_to_base64(bin_param):
-        return ""
-    
-    url = "https://xxz-xyzw.hortorgames.com/login/authuser?_seq=1"
-    try:
-        # 使用 safe_path 获取用户目录下的文件
-        file_path = safe_path_with_username(valid_user, bin_param)
-        with open(file_path, 'rb') as f:
-           payload = f.read()
-    except FileNotFoundError:
-        return jsonify({"error": "文件未找到"}), 404
-    except PermissionError:
-        return jsonify({"error": "权限不足"}), 403
-
-    headers = {
-   'User-Agent': 'Dalvik/2.1.0 (Linux; U; Android 7.1.2; SM-G9810 Build/QP1A.190711.020)',
-   'Host': 'xxz-xyzw.hortorgames.com',
-   'Content-Type': 'application/octet-stream'
-    }
-
-    response = requests.request("POST", url, headers=headers, data=payload)
-    result = extract_target_chars(response.text)
-    roletoken = extract_token_content(result)
-    json_data = {"roleToken": roletoken}
-    json_result = json.dumps(json_data, indent=2)
-    base64str = encode_to_base64(json_result)
-    json_data1 = {"token": base64str}
-    json_result1 = json.dumps(json_data1, indent=2)
-    return json_result1
-
-# 1. 替换硬编码端口（适配平台的 PORT 环境变量）
 if __name__ == '__main__':
-    port = int(os.environ.get('PORT', 5000))  # 读取平台端口变量
-    app.run(host='0.0.0.0', port=port, debug=False)  # 关闭debug（安全+平台要求）
-
-# 2. 会话存储适配（免费平台无本地存储，改用简单的文件/调整）
-# 原session依赖本地文件，免费平台多为临时文件系统，可替换为：
-# （可选）如果平台支持Redis（如Render有免费层），可改用Redis存储，否则保持默认（但会话可能不稳定）
-app.secret_key = os.environ.get('SECRET_KEY', os.urandom(24))  # 建议从环境变量配置密钥
-
-# 3. 配置文件路径调整（免费平台临时目录）
-BASE_DIR = os.environ.get('BASE_DIR', os.path.dirname(os.path.abspath(__file__)))
-CONFIG_FILE = os.path.join(BASE_DIR, 'config.json')
-BIN_DIR = os.path.join(BASE_DIR, 'bin')
-
-# 注：免费平台的本地文件系统是临时的！重启后文件会丢失！
-# 如果需要持久化bin文件/配置，需改用云存储（如S3/云开发存储），下文会提
+    # 适配Render部署：监听0.0.0.0，端口用环境变量，关闭调试模式
+    app.run(
+        host='0.0.0.0',
+        port=PORT,
+        debug=False  # 生产环境必须关闭debug
+    )
