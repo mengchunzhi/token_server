@@ -341,6 +341,11 @@ def index():
         .hint { color: #666; font-size: 0.9em; margin: 5px 0; }
         .remark-cell { max-width: 180px; word-break: break-all; }
         button.update-btn { background-color: #17a2b8; }
+        .drag-handle { cursor: grab; color: #999; padding: 0 6px; user-select: none; }
+        .drag-handle:hover { color: #333; }
+        .drag-handle:active { cursor: grabbing; }
+        tr.dragging { opacity: 0.5; }
+        tr.drag-over { border-top: 2px solid #007bff; }
     </style>
 </head>
 <body>
@@ -521,13 +526,14 @@ def index():
                 
                 files.forEach(file => {
                     const tr = document.createElement('tr');
+                    tr.draggable = true;
+                    tr.dataset.filename = file.filename;
+                    tr.dataset.remark = file.remark || '';
                     const fullUrl = `${window.location.origin}${file.url}`;
                     const remark = (file.remark || '').replace(/</g, '&lt;').replace(/"/g, '&quot;');
                     const safeFilename = (file.filename || '').replace(/"/g, '&quot;');
-                    tr.dataset.filename = file.filename;
-                    tr.dataset.remark = file.remark || '';
                     tr.innerHTML = `
-                        <td>${file.filename.replace(/</g, '&lt;')}</td>
+                        <td><span class="drag-handle" title="拖拽排序">⋮⋮</span> ${file.filename.replace(/</g, '&lt;')}</td>
                         <td class="url-cell">
                             <a href="${file.url}" target="_blank">${file.url}</a>
                             <button class="copy-btn" type="button" data-fullurl="${fullUrl.replace(/"/g, '&quot;')}">复制完整链接</button>
@@ -555,6 +561,7 @@ def index():
                 document.querySelectorAll('#fileTable .copy-btn[data-fullurl]').forEach(btn => {
                     btn.addEventListener('click', function() { copyToClipboard(this.getAttribute('data-fullurl')); });
                 });
+                setupDragDrop();
             } catch (error) {
                 console.error('加载文件失败:', error);
                 // alert('加载文件列表失败');
@@ -672,6 +679,54 @@ def index():
             });
         }
 
+        function setupDragDrop() {
+            const tbody = document.querySelector('#fileTable tbody');
+            let draggedRow = null;
+            tbody.querySelectorAll('tr').forEach(tr => {
+                tr.addEventListener('dragstart', function(e) {
+                    draggedRow = this;
+                    this.classList.add('dragging');
+                    e.dataTransfer.effectAllowed = 'move';
+                    e.dataTransfer.setData('text/plain', this.dataset.filename);
+                });
+                tr.addEventListener('dragend', function() {
+                    this.classList.remove('dragging');
+                    tbody.querySelectorAll('tr').forEach(r => r.classList.remove('drag-over'));
+                    draggedRow = null;
+                });
+                tr.addEventListener('dragover', function(e) {
+                    e.preventDefault();
+                    e.dataTransfer.dropEffect = 'move';
+                    if (this !== draggedRow) this.classList.add('drag-over');
+                });
+                tr.addEventListener('dragleave', function() { this.classList.remove('drag-over'); });
+                tr.addEventListener('drop', async function(e) {
+                    e.preventDefault();
+                    this.classList.remove('drag-over');
+                    if (!draggedRow || draggedRow === this) return;
+                    const rows = Array.from(tbody.querySelectorAll('tr'));
+                    const fromIdx = rows.indexOf(draggedRow);
+                    const toIdx = rows.indexOf(this);
+                    if (fromIdx < 0 || toIdx < 0) return;
+                    if (fromIdx < toIdx) this.parentNode.insertBefore(draggedRow, this.nextSibling);
+                    else this.parentNode.insertBefore(draggedRow, this);
+                    const order = Array.from(tbody.querySelectorAll('tr')).map(r => r.dataset.filename);
+                    try {
+                        const res = await fetch(`${API_BASE}/api/files/order`, {
+                            method: 'PATCH',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({ order: order })
+                        });
+                        const data = await res.json();
+                        if (!res.ok) alert('保存顺序失败: ' + (data.error || '未知错误'));
+                    } catch (err) {
+                        alert('保存顺序出错');
+                        loadFiles();
+                    }
+                });
+            });
+        }
+
         // 页面加载时获取文件列表
         loadFiles();
     </script>
@@ -689,17 +744,22 @@ def list_files():
     user_token = current_config['users'][username]['token']
     
     file_remarks = current_config['users'][username].get('file_remarks', {})
+    file_order = current_config['users'][username].get('file_order', [])
     try:
-        for filename in os.listdir(user_dir):
-            if filename.endswith('.bin'):
-                name_no_ext = os.path.splitext(filename)[0]
-                encoded_key = encode_to_base64(name_no_ext)
-                files.append({
-                    "filename": filename,
-                    "name": name_no_ext,
-                    "url": f"/{user_token}/{name_no_ext}/{encoded_key}",
-                    "remark": file_remarks.get(filename, '')
-                })
+        all_filenames = [f for f in os.listdir(user_dir) if f.endswith('.bin')]
+        # 按 file_order 排序，未在 order 中的排在后面
+        order_set = {f for f in file_order if f in all_filenames}
+        ordered = [f for f in file_order if f in order_set]
+        rest = sorted([f for f in all_filenames if f not in order_set])
+        for filename in ordered + rest:
+            name_no_ext = os.path.splitext(filename)[0]
+            encoded_key = encode_to_base64(name_no_ext)
+            files.append({
+                "filename": filename,
+                "name": name_no_ext,
+                "url": f"/{user_token}/{name_no_ext}/{encoded_key}",
+                "remark": file_remarks.get(filename, '')
+            })
     except Exception as e:
         return jsonify({"error": str(e)}), 500
     return jsonify(files)
@@ -742,13 +802,18 @@ def upload_file():
             return jsonify({"error": str(e)}), 500
 
     uploaded_count = 0
+    current_config = load_config()
+    file_order = current_config['users'][username].get('file_order', [])
     for file in files:
         if file and file.filename.endswith('.bin'):
             filename = werkzeug.utils.secure_filename(file.filename)
             file.save(os.path.join(user_dir, filename))
+            if filename not in file_order:
+                file_order.append(filename)
             uploaded_count += 1
-
     if uploaded_count > 0:
+        current_config['users'][username]['file_order'] = file_order
+        save_config(current_config)
         return jsonify({"message": "文件上传成功", "uploaded_count": uploaded_count})
     return jsonify({"error": "没有有效的 bin 文件上传"}), 400
 
@@ -766,12 +831,16 @@ def delete_file(filename):
     if os.path.exists(file_path):
         try:
             os.remove(file_path)
-            # 删除该文件对应的备注
+            # 删除该文件对应的备注和排序
             current_config = load_config()
             if username in current_config.get('users', {}):
                 remarks = current_config['users'][username].get('file_remarks', {})
                 remarks.pop(safe_filename, None)
                 current_config['users'][username]['file_remarks'] = remarks
+                order_list = current_config['users'][username].get('file_order', [])
+                if safe_filename in order_list:
+                    order_list.remove(safe_filename)
+                    current_config['users'][username]['file_order'] = order_list
                 save_config(current_config)
             return jsonify({"message": "文件删除成功"})
         except Exception as e:
@@ -804,6 +873,25 @@ def update_file_remark(filename):
     current_config['users'][username].setdefault('file_remarks', {})[safe_filename] = remark
     save_config(current_config)
     return jsonify({"message": "备注已保存", "remark": remark})
+
+
+@app.route('/api/files/order', methods=['PATCH'])
+@login_required
+def update_file_order():
+    username = session.get('username')
+    user_dir = get_user_bin_dir(username)
+    data = request.get_json()
+    if not data or 'order' not in data:
+        return jsonify({"error": "缺少 order 字段"}), 400
+    order = data.get('order', [])
+    if not isinstance(order, list):
+        return jsonify({"error": "order 必须为数组"}), 400
+    existing = {f for f in os.listdir(user_dir) if f.endswith('.bin')}
+    valid_order = [f for f in order if f in existing]
+    current_config = load_config()
+    current_config['users'][username]['file_order'] = valid_order
+    save_config(current_config)
+    return jsonify({"message": "顺序已保存", "order": valid_order})
 
 
 @app.route('/<string:token>/<string:bin_param>/<string:key>')
