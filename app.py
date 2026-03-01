@@ -14,10 +14,158 @@ app = Flask(__name__)
 app.secret_key = os.urandom(24)
 CORS(app)
 
-# 加载配置文件
+# 路径与存储后端
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_FILE = os.path.join(BASE_DIR, 'config.json')
 BIN_DIR = os.path.join(BASE_DIR, 'bin')
+
+# 是否使用 Supabase 持久化（部署到 Render 时配置环境变量即可）
+USE_SUPABASE = bool(os.environ.get('SUPABASE_URL') and os.environ.get('SUPABASE_SERVICE_KEY'))
+_supabase_client = None
+
+def _get_supabase():
+    global _supabase_client
+    if _supabase_client is None and USE_SUPABASE:
+        from supabase import create_client
+        _supabase_client = create_client(
+            os.environ['SUPABASE_URL'],
+            os.environ['SUPABASE_SERVICE_KEY']
+        )
+    return _supabase_client
+
+def _storage_load_config_raw():
+    """从当前后端读取 config 原始数据（dict 或 None）。"""
+    if USE_SUPABASE:
+        try:
+            sb = _get_supabase()
+            r = sb.table('app_config').select('config').eq('id', 'main').execute()
+            if r.data and len(r.data) > 0 and r.data[0].get('config'):
+                return r.data[0]['config']
+            return None
+        except Exception:
+            return None
+    if os.path.exists(CONFIG_FILE):
+        try:
+            with open(CONFIG_FILE, 'r') as f:
+                return json.load(f)
+        except Exception:
+            return None
+    return None
+
+def _storage_save_config_raw(config_data):
+    """将 config 写入当前后端。"""
+    if USE_SUPABASE:
+        sb = _get_supabase()
+        sb.table('app_config').upsert({'id': 'main', 'config': config_data}, on_conflict='id').execute()
+        return
+    with open(CONFIG_FILE, 'w') as f:
+        json.dump(config_data, f, indent=4)
+
+def _storage_list_user_filenames(username):
+    """返回该用户下所有 .bin 文件名列表。"""
+    if USE_SUPABASE:
+        try:
+            sb = _get_supabase()
+            files = sb.storage.from_('bin-files').list(username)
+            out = []
+            for f in (files or []):
+                name = f.get('name') or ''
+                if '/' in name:
+                    name = name.split('/')[-1]
+                if name.endswith('.bin'):
+                    out.append(name)
+            return out
+        except Exception:
+            return []
+    user_dir = os.path.join(BIN_DIR, username)
+    if not os.path.exists(user_dir):
+        return []
+    return [f for f in os.listdir(user_dir) if f.endswith('.bin')]
+
+def _storage_read_file(username, filename):
+    """读取用户文件内容，返回 bytes。不存在或出错则返回 None。"""
+    if USE_SUPABASE:
+        try:
+            sb = _get_supabase()
+            path = f"{username}/{filename}"
+            data = sb.storage.from_('bin-files').download(path)
+            return data if isinstance(data, bytes) else bytes(data)
+        except Exception:
+            return None
+    path = os.path.join(BIN_DIR, username, filename)
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, 'rb') as f:
+            return f.read()
+    except Exception:
+        return None
+
+def _storage_write_file(username, filename, data):
+    """写入用户文件。data 为 bytes。"""
+    if USE_SUPABASE:
+        sb = _get_supabase()
+        path = f"{username}/{filename}"
+        sb.storage.from_('bin-files').upload(path, data, {'content-type': 'application/octet-stream', 'upsert': True})
+        return
+    user_dir = os.path.join(BIN_DIR, username)
+    os.makedirs(user_dir, exist_ok=True)
+    with open(os.path.join(user_dir, filename), 'wb') as f:
+        f.write(data)
+
+def _storage_delete_file(username, filename):
+    """删除用户下的一个文件。"""
+    if USE_SUPABASE:
+        sb = _get_supabase()
+        path = f"{username}/{filename}"
+        sb.storage.from_('bin-files').remove([path])
+        return
+    path = os.path.join(BIN_DIR, username, filename)
+    if os.path.exists(path):
+        os.remove(path)
+
+def _storage_file_exists(username, filename):
+    """判断用户下是否存在该文件。"""
+    if USE_SUPABASE:
+        try:
+            sb = _get_supabase()
+            files = sb.storage.from_('bin-files').list(username)
+            for f in (files or []):
+                name = f.get('name') or ''
+                if '/' in name:
+                    name = name.split('/')[-1]
+                if name == filename:
+                    return True
+            return False
+        except Exception:
+            return False
+    path = os.path.join(BIN_DIR, username, filename)
+    return os.path.isfile(path)
+
+def _storage_delete_user_files(username):
+    """删除该用户下所有文件（如注销账号时）。"""
+    if USE_SUPABASE:
+        try:
+            sb = _get_supabase()
+            files = sb.storage.from_('bin-files').list(username)
+            if files:
+                paths = []
+                for f in files:
+                    name = f.get('name') or ''
+                    if '/' in name:
+                        name = name.split('/')[-1]
+                    paths.append(f"{username}/{name}")
+                if paths:
+                    sb.storage.from_('bin-files').remove(paths)
+        except Exception:
+            pass
+        return
+    user_dir = os.path.join(BIN_DIR, username)
+    if os.path.exists(user_dir):
+        try:
+            shutil.rmtree(user_dir)
+        except Exception:
+            pass
 
 if not os.path.exists(BIN_DIR):
     os.makedirs(BIN_DIR)
@@ -31,34 +179,28 @@ def load_config():
             }
         }
     }
-    if os.path.exists(CONFIG_FILE):
-        try:
-            with open(CONFIG_FILE, 'r') as f:
-                data = json.load(f)
-                # 迁移旧配置格式
-                if "username" in data:
-                    token = secrets.token_hex(16)
-                    new_config = {
-                        "users": {
-                            data["username"]: {
-                                "password": data.get("password", "password"),
-                                "token": token
-                            }
-                        }
+    data = _storage_load_config_raw()
+    if data is not None:
+        if isinstance(data, dict) and "username" in data:
+            token = secrets.token_hex(16)
+            new_config = {
+                "users": {
+                    data["username"]: {
+                        "password": data.get("password", "password"),
+                        "token": token
                     }
-                    save_config(new_config)
-                    return new_config
-                return data
-        except Exception:
-            return default_config
-    else:
-        # 如果文件不存在，保存默认配置
-        save_config(default_config)
+                }
+            }
+            save_config(new_config)
+            return new_config
+        if isinstance(data, dict):
+            return data
+        return default_config
+    save_config(default_config)
     return default_config
 
 def save_config(config_data):
-    with open(CONFIG_FILE, 'w') as f:
-        json.dump(config_data, f, indent=4)
+    _storage_save_config_raw(config_data)
 
 config = load_config()
 
@@ -71,31 +213,20 @@ def login_required(f):
     return decorated_function
 
 def get_user_bin_dir(username):
+    """仅本地模式时创建目录；Supabase 模式无本地目录。"""
     user_dir = os.path.join(BIN_DIR, username)
     if not os.path.exists(user_dir):
         os.makedirs(user_dir)
     return user_dir
-
-def safe_path_with_username(username, bin_param):
-    # 过滤危险字符，拼接安全路径
-    filename = f"{bin_param}.bin"
-    safe_filename = werkzeug.utils.secure_filename(filename)
-    return os.path.join(get_user_bin_dir(username), safe_filename)
 
 def extract_target_chars(text):
     # 保留字母(a-zA-Z)、数字(0-9)及特定符号(+=?/)
     pattern = r'[^a-zA-Z0-9+=?/]'
     return re.sub(pattern, '', text)
 
-ALLOWED_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'bin')  # 限制文件读取目录
+ALLOWED_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'bin')
 if not os.path.exists(ALLOWED_DIR):
     os.makedirs(ALLOWED_DIR)
-
-def safe_path(bin_param):
-    # 过滤危险字符，拼接安全路径
-    filename = f"{bin_param}.bin"
-    safe_filename = os.path.basename(filename)  # 防止路径遍历
-    return os.path.join(ALLOWED_DIR, safe_filename)
     
 def extract_token_content(result_str):
     # 查找'token'的位置（注意大小写）
@@ -269,13 +400,11 @@ def delete_account():
         del current_config['users'][username]
         save_config(current_config)
     
-    # 删除用户目录
-    user_dir = get_user_bin_dir(username)
-    if os.path.exists(user_dir):
-        try:
-            shutil.rmtree(user_dir)
-        except Exception as e:
-            return jsonify({"error": f"删除文件失败: {str(e)}"}), 500
+    # 删除该用户所有文件（本地或 Supabase）
+    try:
+        _storage_delete_user_files(username)
+    except Exception as e:
+        return jsonify({"error": f"删除文件失败: {str(e)}"}), 500
             
     # 登出
     session.pop('logged_in', None)
@@ -739,15 +868,12 @@ def index():
 def list_files():
     files = []
     username = session.get('username')
-    user_dir = get_user_bin_dir(username)
     current_config = load_config()
     user_token = current_config['users'][username]['token']
-    
     file_remarks = current_config['users'][username].get('file_remarks', {})
     file_order = current_config['users'][username].get('file_order', [])
     try:
-        all_filenames = [f for f in os.listdir(user_dir) if f.endswith('.bin')]
-        # 按 file_order 排序，未在 order 中的排在后面
+        all_filenames = _storage_list_user_filenames(username)
         order_set = {f for f in file_order if f in all_filenames}
         ordered = [f for f in file_order if f in order_set]
         rest = sorted([f for f in all_filenames if f not in order_set])
@@ -775,16 +901,13 @@ def upload_file():
         return jsonify({"error": "未选择文件"}), 400
 
     username = session.get('username')
-    user_dir = get_user_bin_dir(username)
     replace_filename = request.form.get('replace_filename', '').strip()
 
-    # 更新上传：用新文件覆盖指定已存在的 .bin，URL 保持不变
     if replace_filename:
         if not replace_filename.endswith('.bin'):
             return jsonify({"error": "replace_filename 必须为 .bin 文件"}), 400
         safe_replace = werkzeug.utils.secure_filename(replace_filename)
-        target_path = os.path.join(user_dir, safe_replace)
-        if not os.path.exists(target_path):
+        if not _storage_file_exists(username, safe_replace):
             return jsonify({"error": "要更新的文件不存在"}), 404
         if len(files) != 1 or not files[0].filename:
             return jsonify({"error": "更新时请只选择一个文件"}), 400
@@ -792,7 +915,8 @@ def upload_file():
         if not file.filename.endswith('.bin'):
             return jsonify({"error": "只能上传 .bin 文件"}), 400
         try:
-            file.save(target_path)
+            data = file.read()
+            _storage_write_file(username, safe_replace, data)
             return jsonify({
                 "message": "文件已更新，Token URL 未变",
                 "updated_count": 1,
@@ -807,7 +931,8 @@ def upload_file():
     for file in files:
         if file and file.filename.endswith('.bin'):
             filename = werkzeug.utils.secure_filename(file.filename)
-            file.save(os.path.join(user_dir, filename))
+            data = file.read()
+            _storage_write_file(username, filename, data)
             if filename not in file_order:
                 file_order.append(filename)
             uploaded_count += 1
@@ -822,31 +947,25 @@ def upload_file():
 def delete_file(filename):
     if not filename.endswith('.bin'):
         return jsonify({"error": "无效的文件名"}), 400
-    
     username = session.get('username')
-    user_dir = get_user_bin_dir(username)
     safe_filename = werkzeug.utils.secure_filename(filename)
-    file_path = os.path.join(user_dir, safe_filename)
-    
-    if os.path.exists(file_path):
-        try:
-            os.remove(file_path)
-            # 删除该文件对应的备注和排序
-            current_config = load_config()
-            if username in current_config.get('users', {}):
-                remarks = current_config['users'][username].get('file_remarks', {})
-                remarks.pop(safe_filename, None)
-                current_config['users'][username]['file_remarks'] = remarks
-                order_list = current_config['users'][username].get('file_order', [])
-                if safe_filename in order_list:
-                    order_list.remove(safe_filename)
-                    current_config['users'][username]['file_order'] = order_list
-                save_config(current_config)
-            return jsonify({"message": "文件删除成功"})
-        except Exception as e:
-            return jsonify({"error": str(e)}), 500
-    else:
+    if not _storage_file_exists(username, safe_filename):
         return jsonify({"error": "文件未找到"}), 404
+    try:
+        _storage_delete_file(username, safe_filename)
+        current_config = load_config()
+        if username in current_config.get('users', {}):
+            remarks = current_config['users'][username].get('file_remarks', {})
+            remarks.pop(safe_filename, None)
+            current_config['users'][username]['file_remarks'] = remarks
+            order_list = current_config['users'][username].get('file_order', [])
+            if safe_filename in order_list:
+                order_list.remove(safe_filename)
+                current_config['users'][username]['file_order'] = order_list
+            save_config(current_config)
+        return jsonify({"message": "文件删除成功"})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 
 REMARK_MAX_LENGTH = 500
@@ -858,10 +977,8 @@ def update_file_remark(filename):
     if not filename.endswith('.bin'):
         return jsonify({"error": "无效的文件名"}), 400
     username = session.get('username')
-    user_dir = get_user_bin_dir(username)
     safe_filename = werkzeug.utils.secure_filename(filename)
-    file_path = os.path.join(user_dir, safe_filename)
-    if not os.path.exists(file_path):
+    if not _storage_file_exists(username, safe_filename):
         return jsonify({"error": "文件未找到"}), 404
     data = request.get_json()
     if not data or 'remark' not in data:
@@ -879,14 +996,13 @@ def update_file_remark(filename):
 @login_required
 def update_file_order():
     username = session.get('username')
-    user_dir = get_user_bin_dir(username)
     data = request.get_json()
     if not data or 'order' not in data:
         return jsonify({"error": "缺少 order 字段"}), 400
     order = data.get('order', [])
     if not isinstance(order, list):
         return jsonify({"error": "order 必须为数组"}), 400
-    existing = {f for f in os.listdir(user_dir) if f.endswith('.bin')}
+    existing = set(_storage_list_user_filenames(username))
     valid_order = [f for f in order if f in existing]
     current_config = load_config()
     current_config['users'][username]['file_order'] = valid_order
@@ -912,17 +1028,12 @@ def home(token, bin_param, key):
 
     if key != encode_to_base64(bin_param):
         return ""
-    
-    url = "https://xxz-xyzw.hortorgames.com/login/authuser?_seq=1"
-    try:
-        # 使用 safe_path 获取用户目录下的文件
-        file_path = safe_path_with_username(valid_user, bin_param)
-        with open(file_path, 'rb') as f:
-           payload = f.read()
-    except FileNotFoundError:
+    safe_filename = werkzeug.utils.secure_filename(f"{bin_param}.bin")
+    payload = _storage_read_file(valid_user, safe_filename)
+    if payload is None:
         return jsonify({"error": "文件未找到"}), 404
-    except PermissionError:
-        return jsonify({"error": "权限不足"}), 403
+
+    url = "https://xxz-xyzw.hortorgames.com/login/authuser?_seq=1"
 
     headers = {
    'User-Agent': 'Dalvik/2.1.0 (Linux; U; Android 7.1.2; SM-G9810 Build/QP1A.190711.020)',
