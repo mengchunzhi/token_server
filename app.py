@@ -106,7 +106,15 @@ def _storage_write_file(username, filename, data):
     if USE_SUPABASE:
         sb = _get_supabase()
         path = f"{username}/{filename}"
-        sb.storage.from_('bin-files').upload(path, data, {'content-type': 'application/octet-stream', 'upsert': True})
+        # 修复：1. upsert 作为独立参数传入 2. headers 仅传合法的字符串值
+        sb.storage.from_('bin-files').upload(
+            path=path,
+            file=data,
+            file_options={
+                'content-type': 'application/octet-stream'
+            },
+            upsert=True  # 独立传参，而非放在 headers 里
+        )
         return
     user_dir = os.path.join(BIN_DIR, username)
     os.makedirs(user_dir, exist_ok=True)
