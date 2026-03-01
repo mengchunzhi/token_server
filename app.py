@@ -106,14 +106,17 @@ def _storage_write_file(username, filename, data):
     if USE_SUPABASE:
         sb = _get_supabase()
         path = f"{username}/{filename}"
-        # 修复：1. upsert 作为独立参数传入 2. headers 仅传合法的字符串值
+        # 方案1：适配低版本 SDK（无 upsert 参数，先删后传实现覆盖）
+        try:
+            # 先尝试删除旧文件（如果存在），避免重复上传报错
+            sb.storage.from_('bin-files').remove([path])
+        except Exception:
+            pass  # 无旧文件则忽略异常
+        # 上传新文件（仅传合法的 headers，无布尔值）
         sb.storage.from_('bin-files').upload(
-            path=path,
-            file=data,
-            file_options={
-                'content-type': 'application/octet-stream'
-            },
-            upsert=True  # 独立传参，而非放在 headers 里
+            path,
+            data,
+            {'content-type': 'application/octet-stream'}
         )
         return
     user_dir = os.path.join(BIN_DIR, username)
