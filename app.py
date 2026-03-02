@@ -24,32 +24,57 @@ USE_SUPABASE = bool(os.environ.get('SUPABASE_URL') and os.environ.get('SUPABASE_
 _supabase_client = None
 
 def _get_supabase():
+    """获取 Supabase 客户端，增加重试和连接验证"""
     global _supabase_client
     if _supabase_client is None and USE_SUPABASE:
-        from supabase import create_client
-        _supabase_client = create_client(
-            os.environ['SUPABASE_URL'],
-            os.environ['SUPABASE_SERVICE_KEY']
-        )
+        max_retries = 3
+        retry_count = 0
+        while retry_count < max_retries:
+            try:
+                # 从环境变量读取密钥（Render 上配置）
+                url = os.environ['SUPABASE_URL']
+                key = os.environ['SUPABASE_SERVICE_KEY']
+                _supabase_client = create_client(url, key)
+                # 测试连接（确保能正常访问表）
+                _supabase_client.table('app_config').select('id').limit(1).execute()
+                break
+            except Exception as e:
+                retry_count += 1
+                print(f"Supabase 连接失败（重试 {retry_count}/{max_retries}）: {str(e)}")
+                time.sleep(1)
+        if _supabase_client is None:
+            raise Exception("Supabase 连接失败，无法继续")
     return _supabase_client
 
 def _storage_load_config_raw():
-    """从当前后端读取 config 原始数据（dict 或 None）。"""
+    """
+    读取原始配置数据，核心规则：
+    - Supabase 有记录 → 返回记录中的 config（哪怕是空dict）
+    - Supabase 无记录 → 返回 None（表示真的没有配置）
+    - 读取异常 → 返回空dict（不返回None，避免触发默认配置）
+    """
     if USE_SUPABASE:
         try:
             sb = _get_supabase()
-            r = sb.table('app_config').select('config').eq('id', 'main').execute()
-            if r.data and len(r.data) > 0 and r.data[0].get('config'):
-                return r.data[0]['config']
-            return None
-        except Exception:
-            return None
+            # 查询 app_config 表中 id=main 的记录
+            response = sb.table('app_config').select('config').eq('id', 'main').execute()
+            
+            # 关键判断：只有「完全没有记录」时才返回 None
+            if not response.data or len(response.data) == 0:
+                return None  # 无记录，后续可初始化默认配置
+            # 有记录 → 不管 config 字段是否为空，都返回该字段的值（空dict/自定义配置）
+            return response.data[0].get('config', {})
+        except Exception as e:
+            print(f"Supabase 读取配置异常: {str(e)}")
+            return {}  # 异常时返回空dict，不触发默认配置覆盖
+    # 本地配置逻辑（如果不需要可保留你原有代码）
     if os.path.exists(CONFIG_FILE):
         try:
             with open(CONFIG_FILE, 'r') as f:
                 return json.load(f)
-        except Exception:
-            return None
+        except Exception as e:
+            print(f"本地读取配置异常: {str(e)}")
+            return {}
     return None
 
 def _storage_save_config_raw(config_data):
@@ -182,7 +207,14 @@ if not os.path.exists(BIN_DIR):
     os.makedirs(BIN_DIR)
 
 def load_config():
-    default_config = {
+    """
+    加载配置的核心函数，安全逻辑：
+    1. 优先读取 Supabase/本地配置
+    2. 仅当「完全无记录」时，才初始化默认配置
+    3. 任何情况下不覆盖已有配置
+    """
+    # 默认配置（仅在完全无配置时使用）
+    DEFAULT_CONFIG = {
         "users": {
             "admin": {
                 "password": "admin123",
@@ -190,28 +222,52 @@ def load_config():
             }
         }
     }
-    data = _storage_load_config_raw()
-    if data is not None:
-        if isinstance(data, dict) and "username" in data:
-            token = secrets.token_hex(16)
-            new_config = {
-                "users": {
-                    data["username"]: {
-                        "password": data.get("password", "password"),
-                        "token": token
-                    }
-                }
-            }
-            save_config(new_config)
-            return new_config
-        if isinstance(data, dict):
-            return data
-        return default_config
-    save_config(default_config)
-    return default_config
+    
+    # 读取原始配置
+    raw_data = _storage_load_config_raw()
+    
+    # 情况1：完全无记录（raw_data=None）→ 初始化默认配置并保存
+    if raw_data is None:
+        print("未找到任何配置，初始化默认配置")
+        save_config(DEFAULT_CONFIG)
+        return DEFAULT_CONFIG
+    
+    # 情况2：读取到数据（空dict/自定义配置）→ 直接返回，绝不覆盖
+    if isinstance(raw_data, dict):
+        # 兜底：如果配置中无users字段，补充空dict（避免后续代码报错）
+        if "users" not in raw_data:
+            raw_data["users"] = {}
+        return raw_data
+    
+    # 极端情况：读取到非dict数据 → 返回空配置（不保存默认值）
+    print("读取到非标准配置数据，使用空配置")
+    return {"users": {}}
 
-def save_config(config_data):
-    _storage_save_config_raw(config_data)
+def save_config(config):
+    """保存配置到 Supabase/本地，仅在配置有效时执行"""
+    if not isinstance(config, dict) or not config:
+        print("无效的配置，跳过保存")
+        return
+    
+    if USE_SUPABASE:
+        try:
+            sb = _get_supabase()
+            # 使用 upsert（更新或插入），避免重复创建
+            sb.table('app_config').upsert({
+                "id": "main",
+                "config": config
+            }).execute()
+            print("配置已保存到 Supabase")
+        except Exception as e:
+            print(f"Supabase 保存配置失败: {str(e)}")
+    else:
+        # 本地保存逻辑（保留你原有代码即可）
+        try:
+            with open(CONFIG_FILE, 'w') as f:
+                json.dump(config, f, indent=2)
+            print("配置已保存到本地")
+        except Exception as e:
+            print(f"本地保存配置失败: {str(e)}")
 
 config = load_config()
 
